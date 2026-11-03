@@ -1,0 +1,153 @@
+name: ios
+
+# Builds SMM2 Recomp (github.com/smm2recomp/smm2recomp) for iOS / iPadOS on a macOS runner.
+#
+# This repository is public, so nothing from the game is ever readable here:
+# - the input (the owner's own 3.0.3 ExeFS) lives AES-256 encrypted in a separate private repository, fetched with a
+#   read-only deploy key (secret INPUT_DEPLOY_KEY) and decrypted with secret DATA_KEY;
+# - the outputs (the IPA, which has the recompiled game code linked in, and the full build log) are encrypted with
+#   DATA_KEY before upload, and kept for one day;
+# - the console log is filtered: compiler snippets and warnings from the generated game code are not printed.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: smm2recomp commit to build
+        default: 1328b2a27aeac0c95a77695db912692c9e049dbf
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 330
+    env:
+      R: ${{ github.workspace }}/src/recomp
+      DEPS: ${{ github.workspace }}/deps/ios-device
+      LOG: ${{ github.workspace }}/out/build.log
+      OPENSSL: /opt/homebrew/opt/openssl@3/bin/openssl
+      IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+    steps:
+      - name: smm2recomp source
+        uses: actions/checkout@v4
+        with:
+          repository: smm2recomp/smm2recomp
+          ref: ${{ inputs.ref }}
+          path: src
+
+      - name: Encrypted input (private repository)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/smm2-ios-input
+          ssh-key: ${{ secrets.INPUT_DEPLOY_KEY }}
+          path: input
+          persist-credentials: false
+
+      - name: Decrypt the ExeFS
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+        run: |
+          mkdir -p "$R/private/smm2/extracted" out
+          "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:DATA_KEY -in input/exefs.tar.enc |
+            tar -x -C "$R/private/smm2/extracted"
+          rm -rf input
+          ls "$R/private/smm2/extracted/exefs"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Tools
+        run: |
+          brew install ninja
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: SDL3 for iOS (static)
+        run: |
+          mkdir -p dl
+          curl -fsSL -o dl/SDL3.tar.gz https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-3.4.18.tar.gz
+          echo "9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3  dl/SDL3.tar.gz" | shasum -a 256 -c
+          tar -xzf dl/SDL3.tar.gz -C dl
+          cmake -S dl/SDL3-3.4.18 -B dl/sdl-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_DOCS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$DEPS" > out/sdl.log 2>&1 || { tail -40 out/sdl.log; exit 1; }
+          cmake --build dl/sdl-build >> out/sdl.log 2>&1 || { tail -40 out/sdl.log; exit 1; }
+          cmake --install dl/sdl-build >> out/sdl.log 2>&1
+          ls "$DEPS/lib"
+
+      - name: Recompile the game code to C (from the decrypted ExeFS)
+        working-directory: src/recomp
+        run: |
+          python3 -m venv tools/venv
+          tools/venv/bin/pip install -q capstone==5.0.9 lz4==4.4.5 unicorn==2.1.4
+          make GAME=smm2 gen > "$LOG" 2>&1 || { grep -E 'Error|error|Traceback' "$LOG" | tail -20; exit 1; }
+          grep -E '^(main|sdk): (wrote|[0-9]+ boundaries)' "$LOG" | cut -c1-200 || true
+
+      - name: Course server inside the app (Rust)
+        continue-on-error: true
+        working-directory: src/core
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal --target aarch64-apple-ios
+          cd ../recomp && make TARGET=ios-arm64 GAME=smm2 embed-server > ../../out/embed.log 2>&1 ||
+            { tail -40 ../../out/embed.log; exit 1; }
+          ls -la ../core/target/aarch64-apple-ios/release/libmmk_embed.a
+
+      - name: Build the app
+        working-directory: src/recomp
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          ok=0
+          make -j"$(sysctl -n hw.ncpu)" TARGET=ios-arm64 GAME=smm2 DEPS="$DEPS" app >> "$LOG" 2>&1 && ok=1
+          echo "build: $(( ($(date +%s) - start) / 60 )) min, $(ls build/smm2-ios-arm64/obj/main 2>/dev/null | wc -l) game objects"
+          # (only diagnostics' first lines, never the code snippets under them; warnings from the generated code are skipped)
+          grep -E ': (error|fatal error):|^(ld|clang|make)(: |\[)|Undefined symbols|make_ios_app' "$LOG" |
+            grep -v -E '^\s' | grep -v -E 'generated/.*warning' | tail -60 || true
+          [ "$ok" = 1 ]
+
+      - name: Sign ad hoc with the entitlements and make the IPA
+        working-directory: src/recomp
+        run: |
+          app=build/smm2-ios-arm64/SMM2Recomp.app
+          cat > ent.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+              <key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint ent.plist
+          xcrun strip -S "$app/SMM2Recomp"
+          codesign --force --sign - --entitlements ent.plist --timestamp=none "$app"
+          codesign -d --entitlements - "$app" 2>/dev/null | grep -c kernel
+          mkdir -p ipa/Payload
+          cp -R "$app" ipa/Payload/
+          (cd ipa && zip -qry ../SMM2Recomp.ipa Payload)
+          ls -la SMM2Recomp.ipa
+          du -sh "$app"
+
+      - name: Encrypt the outputs
+        if: always()
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+        run: |
+          mkdir -p enc
+          for f in src/recomp/SMM2Recomp.ipa out/build.log out/embed.log out/sdl.log; do
+            [ -f "$f" ] || continue
+            "$OPENSSL" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:DATA_KEY -in "$f" -out "enc/$(basename "$f").enc"
+          done
+          ls -la enc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: encrypted
+          path: enc/
+          retention-days: 1
+          compression-level: 0
